@@ -309,17 +309,15 @@ class WrkMempoolRack extends TetherWrkBase {
 
     try {
       const timestamps = getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS)
-      let blocksResponse = []
+      // A failed read must not look like an empty history: that would backfill
+      // every day against the public API. The next cycle retries the read.
+      const blocksResponse = await this._getDbData(`${STAT_BLOCKSIZES}-${MEMPOOL_TAG}`, {
+        start: HISTORICAL_DATA_START_TS,
+        end: Date.now(),
+        limit: timestamps.length
+      })
 
-      try {
-        blocksResponse = await this._getDbData(`${STAT_BLOCKSIZES}-${MEMPOOL_TAG}`, {
-          start: HISTORICAL_DATA_START_TS,
-          end: Date.now(),
-          limit: timestamps.length
-        })
-      } catch (_) {}
-
-      for (const ts of this._missingTimestamps(timestamps, blocksResponse)) {
+      for (const ts of this._timestampsToFetch(timestamps, blocksResponse)) {
         if (this._isApiThrottled()) break
         await this._fetchAndSaveHistoricalBlockSize(ts)
       }
@@ -330,12 +328,16 @@ class WrkMempoolRack extends TetherWrkBase {
     }
   }
 
-  // Only the days with no stored row are fetched, so a few days lost to
-  // upstream errors cost a few calls on the next run rather than a re-fetch
-  // of the whole history. A day that stays unfetched (or a throttled run cut
-  // short) is simply picked up again on the next cycle.
-  _missingTimestamps (timestamps, rows) {
+  // Days with no stored row, plus today. A few days lost to upstream errors
+  // then cost a few calls on the next run rather than a re-fetch of the whole
+  // history, and a throttled run cut short is picked up again on the next
+  // cycle. Today is always refetched: its block is whichever block is closest
+  // to midnight, and that answer can still change until one is mined nearer
+  // than the last pre-midnight block.
+  _timestampsToFetch (timestamps, rows) {
+    const today = timestamps[timestamps.length - 1]
     const stored = new Set(rows.map((row) => row?.ts))
+    if (today !== undefined) stored.delete(today)
     return timestamps.filter((ts) => !stored.has(ts))
   }
 
@@ -345,17 +347,15 @@ class WrkMempoolRack extends TetherWrkBase {
 
     try {
       const timestamps = getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS)
-      let pricesResponse = []
+      // Same as block sizes: a failed read skips this run rather than
+      // backfilling every day.
+      const pricesResponse = await this._getDbData(`${STAT_PRICES}-${MEMPOOL_TAG}`, {
+        start: HISTORICAL_DATA_START_TS,
+        end: Date.now(),
+        limit: timestamps.length
+      })
 
-      try {
-        pricesResponse = await this._getDbData(`${STAT_PRICES}-${MEMPOOL_TAG}`, {
-          start: HISTORICAL_DATA_START_TS,
-          end: Date.now(),
-          limit: timestamps.length
-        })
-      } catch (_) {}
-
-      for (const ts of this._missingTimestamps(timestamps, pricesResponse)) {
+      for (const ts of this._timestampsToFetch(timestamps, pricesResponse)) {
         if (this._isApiThrottled()) break
         await this._fetchAndSaveHistoricalPrice(ts)
       }
@@ -433,12 +433,14 @@ class WrkMempoolRack extends TetherWrkBase {
   }
 
   // A 429 pauses the whole chain: for Retry-After when upstream sends one,
-  // otherwise for a doubling backoff that a successful call resets.
+  // otherwise for a doubling backoff. Either pause is capped, and a
+  // successful call resets the backoff.
   _onApiRateLimited (err) {
     const retryAfterSec = Number(err?.headers?.['retry-after'])
-    const backoffMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+    const requestedMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
       ? retryAfterSec * 1000
-      : Math.min(Math.max((this._apiBackoffMs || 0) * 2, API_BACKOFF_MIN_MS), API_BACKOFF_MAX_MS)
+      : Math.max((this._apiBackoffMs || 0) * 2, API_BACKOFF_MIN_MS)
+    const backoffMs = Math.min(requestedMs, API_BACKOFF_MAX_MS)
     this._apiBackoffMs = backoffMs
     this._apiPausedUntil = Date.now() + backoffMs
     console.error(new Date().toISOString(), `ERR_API_RATE_LIMITED, pausing upstream calls for ${backoffMs}ms`)

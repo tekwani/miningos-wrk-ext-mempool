@@ -17,9 +17,10 @@ const {
   POOL_REBATES_DATA_KEY,
   PRICE_AT_TIMESTAMPS_DATA_KEY,
   PRICE_BUCKET_MS,
-  HTTP_STATUS_TOO_MANY_REQUESTS
+  HTTP_STATUS_TOO_MANY_REQUESTS,
+  API_BACKOFF_MAX_MS
 } = require('../../workers/lib/constants')
-const { getUTCMidnightTimestampsSince, priceBucket } = require('../../workers/lib/utils')
+const { getUTCMidnightTimestampsSince, getUTCMidnightToday, priceBucket } = require('../../workers/lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 
 const historicalEntryCount = () => getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS).length
@@ -420,7 +421,7 @@ const storedDays = (skip = []) => getUTCMidnightTimestampsSince(HISTORICAL_DATA_
   .filter((ts) => !skip.includes(ts))
   .map((ts) => ({ ts }))
 
-test('saveHistoricalPrices fetches nothing when every day is stored', async (t) => {
+test('saveHistoricalPrices refreshes today even when every day is stored', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
   wrk.fetchingHistoricalPricesData = false
@@ -429,11 +430,11 @@ test('saveHistoricalPrices fetches nothing when every day is stored', async (t) 
 
   await wrk.saveHistoricalPrices()
 
-  t.is(calls.length, 0)
+  t.alike(calls, [getUTCMidnightToday()])
   t.is(wrk.fetchingHistoricalPricesData, false)
 })
 
-test('saveHistoricalPrices fetches only the missing days', async (t) => {
+test('saveHistoricalPrices fetches the missing days and refreshes today', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
   const missing = [HISTORICAL_DATA_START_TS + 3 * MS_24_HOURS, HISTORICAL_DATA_START_TS + 10 * MS_24_HOURS]
@@ -443,10 +444,10 @@ test('saveHistoricalPrices fetches only the missing days', async (t) => {
 
   await wrk.saveHistoricalPrices()
 
-  t.alike(calls, missing)
+  t.alike(calls, [...missing, getUTCMidnightToday()])
 })
 
-test('saveHistoricalBlockSizes fetches only the missing days', async (t) => {
+test('saveHistoricalBlockSizes fetches the missing days and refreshes today', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
   const missing = [HISTORICAL_DATA_START_TS + 5 * MS_24_HOURS]
@@ -456,7 +457,26 @@ test('saveHistoricalBlockSizes fetches only the missing days', async (t) => {
 
   await wrk.saveHistoricalBlockSizes()
 
-  t.alike(calls, missing)
+  t.alike(calls, [...missing, getUTCMidnightToday()])
+  t.is(wrk.fetchingHistoricalBlocksData, false)
+})
+
+test('historical fetch skips the run when stored rows cannot be read', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let priceCalls = 0
+  let blockCalls = 0
+  wrk.fetchingHistoricalPricesData = false
+  wrk.fetchingHistoricalBlocksData = false
+  wrk._getDbData = async () => { throw new Error('db down') }
+  wrk._fetchAndSaveHistoricalPrice = async () => { priceCalls++ }
+  wrk._fetchAndSaveHistoricalBlockSize = async () => { blockCalls++ }
+
+  await wrk.saveHistoricalPrices()
+  await wrk.saveHistoricalBlockSizes()
+
+  t.is(priceCalls, 0)
+  t.is(blockCalls, 0)
+  t.is(wrk.fetchingHistoricalPricesData, false)
   t.is(wrk.fetchingHistoricalBlocksData, false)
 })
 
@@ -486,6 +506,17 @@ test('_apiCall pauses the chain on 429 using Retry-After', async (t) => {
 
   t.ok(wrk._isApiThrottled())
   t.ok(wrk._apiPausedUntil - Date.now() > 115000 && wrk._apiPausedUntil - Date.now() <= 120000)
+})
+
+test('_apiCall caps a long Retry-After at the backoff maximum', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  wrk._rateLimitDelay = async () => {}
+
+  await t.exception(() => wrk._apiCall(async () => { throw rateLimitedError({ 'retry-after': '86400' }) }, null), /429/)
+
+  t.is(wrk._apiBackoffMs, API_BACKOFF_MAX_MS)
+  const remaining = wrk._apiPausedUntil - Date.now()
+  t.ok(remaining > API_BACKOFF_MAX_MS - 5000 && remaining <= API_BACKOFF_MAX_MS)
 })
 
 test('_apiCall backs off exponentially without Retry-After and resets on success', async (t) => {
