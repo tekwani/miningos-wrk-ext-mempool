@@ -16,7 +16,8 @@ const {
   HISTORICAL_DATA_START_TS,
   POOL_REBATES_DATA_KEY,
   PRICE_AT_TIMESTAMPS_DATA_KEY,
-  PRICE_BUCKET_MS
+  PRICE_BUCKET_MS,
+  HTTP_STATUS_TOO_MANY_REQUESTS
 } = require('../../workers/lib/constants')
 const { getUTCMidnightTimestampsSince, priceBucket } = require('../../workers/lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
@@ -415,30 +416,116 @@ test('_fetchAndSaveHistoricalBlockSize saves block size and reward fields', asyn
   t.is(saved[0].data.blockTotalFees, 30)
 })
 
-test('saveHistoricalPrices fetches only latest when db already seeded', async (t) => {
+const storedDays = (skip = []) => getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS)
+  .filter((ts) => !skip.includes(ts))
+  .map((ts) => ({ ts }))
+
+test('saveHistoricalPrices fetches nothing when every day is stored', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
   wrk.fetchingHistoricalPricesData = false
-  wrk._getDbData = async () => (new Array(historicalEntryCount())).fill({})
+  wrk._getDbData = async () => storedDays()
   wrk._fetchAndSaveHistoricalPrice = async (ts) => { calls.push(ts) }
 
   await wrk.saveHistoricalPrices()
 
-  t.is(calls.length, 1)
+  t.is(calls.length, 0)
   t.is(wrk.fetchingHistoricalPricesData, false)
 })
 
-test('saveHistoricalBlockSizes fetches only latest when db already seeded', async (t) => {
+test('saveHistoricalPrices fetches only the missing days', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
+  const missing = [HISTORICAL_DATA_START_TS + 3 * MS_24_HOURS, HISTORICAL_DATA_START_TS + 10 * MS_24_HOURS]
+  wrk.fetchingHistoricalPricesData = false
+  wrk._getDbData = async () => storedDays(missing)
+  wrk._fetchAndSaveHistoricalPrice = async (ts) => { calls.push(ts) }
+
+  await wrk.saveHistoricalPrices()
+
+  t.alike(calls, missing)
+})
+
+test('saveHistoricalBlockSizes fetches only the missing days', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const calls = []
+  const missing = [HISTORICAL_DATA_START_TS + 5 * MS_24_HOURS]
   wrk.fetchingHistoricalBlocksData = false
-  wrk._getDbData = async () => (new Array(historicalEntryCount())).fill({})
+  wrk._getDbData = async () => storedDays(missing)
   wrk._fetchAndSaveHistoricalBlockSize = async (ts) => { calls.push(ts) }
 
   await wrk.saveHistoricalBlockSizes()
 
-  t.is(calls.length, 1)
+  t.alike(calls, missing)
   t.is(wrk.fetchingHistoricalBlocksData, false)
+})
+
+test('historical backfill stops once upstream is rate limiting', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const calls = []
+  wrk.fetchingHistoricalPricesData = false
+  wrk._getDbData = async () => []
+  wrk._fetchAndSaveHistoricalPrice = async (ts) => {
+    calls.push(ts)
+    if (calls.length === 2) wrk._apiPausedUntil = Date.now() + 60000
+  }
+
+  await wrk.saveHistoricalPrices()
+
+  t.is(calls.length, 2, 'the remaining days wait for the next cycle')
+  t.is(wrk.fetchingHistoricalPricesData, false)
+})
+
+const rateLimitedError = (headers = {}) => Object.assign(new Error('ERR_HTTP: 429'), { status: HTTP_STATUS_TOO_MANY_REQUESTS, headers })
+
+test('_apiCall pauses the chain on 429 using Retry-After', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  wrk._rateLimitDelay = async () => {}
+
+  await t.exception(() => wrk._apiCall(async () => { throw rateLimitedError({ 'retry-after': '120' }) }, null), /429/)
+
+  t.ok(wrk._isApiThrottled())
+  t.ok(wrk._apiPausedUntil - Date.now() > 115000 && wrk._apiPausedUntil - Date.now() <= 120000)
+})
+
+test('_apiCall backs off exponentially without Retry-After and resets on success', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  wrk._rateLimitDelay = async () => {}
+  const fail = async () => { throw rateLimitedError() }
+
+  await t.exception(() => wrk._apiCall(fail, null))
+  t.is(wrk._apiBackoffMs, 60000)
+  await t.exception(() => wrk._apiCall(fail, null))
+  t.is(wrk._apiBackoffMs, 120000)
+  for (let i = 0; i < 10; i++) await t.exception(() => wrk._apiCall(fail, null))
+  t.is(wrk._apiBackoffMs, 30 * 60 * 1000, 'capped')
+
+  t.is(await wrk._apiCall(async () => 'ok', null), 'ok')
+  t.is(wrk._apiBackoffMs, 0)
+})
+
+test('_apiCall does not back off on non-429 errors', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  wrk._rateLimitDelay = async () => {}
+
+  await t.exception(() => wrk._apiCall(async () => { throw Object.assign(new Error('500'), { status: 500 }) }, null))
+
+  t.is(wrk._isApiThrottled(), false)
+})
+
+test('_apiCall serializes callers on one chain', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const events = []
+  wrk._rateLimitDelay = async () => { events.push('gap') }
+  const call = (name) => wrk._apiCall(async () => {
+    events.push(`start:${name}`)
+    await new Promise((resolve) => setImmediate(resolve))
+    events.push(`end:${name}`)
+  }, null)
+
+  await Promise.all([call('a'), call('b')])
+
+  t.alike(events, ['gap', 'start:a', 'end:a', 'gap', 'start:b', 'end:b'])
 })
 
 test('saveHistoricalBlockSizes and saveHistoricalPrices return if already running', async (t) => {

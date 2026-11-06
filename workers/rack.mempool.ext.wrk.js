@@ -25,10 +25,14 @@ const {
   POOL_REBATES_SYNC_BEE,
   REBATES_SYNC_TICK_MS,
   REBATES_SYNC_OVERLAP_MS,
-  REBATES_SYNC_CRON_DEFAULT
+  REBATES_SYNC_CRON_DEFAULT,
+  API_CALL_GAP_MS,
+  API_BACKOFF_MIN_MS,
+  API_BACKOFF_MAX_MS,
+  HTTP_STATUS_TOO_MANY_REQUESTS
 } = require('./lib/constants')
 const { extractRebates, parseSyncCron, lastCronFire } = require('./lib/rebatesSync')
-const { getUTCMidnightTimestampsSince, getUTCMidnightToday, priceBucket } = require('./lib/utils')
+const { getUTCMidnightTimestampsSince, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const mingo = require('mingo')
@@ -315,18 +319,24 @@ class WrkMempoolRack extends TetherWrkBase {
         })
       } catch (_) {}
 
-      if (blocksResponse.length < timestamps.length - 1) {
-        for (const ts of timestamps) {
-          await this._fetchAndSaveHistoricalBlockSize(ts)
-        }
-      } else {
-        await this._fetchAndSaveHistoricalBlockSize(getUTCMidnightToday())
+      for (const ts of this._missingTimestamps(timestamps, blocksResponse)) {
+        if (this._isApiThrottled()) break
+        await this._fetchAndSaveHistoricalBlockSize(ts)
       }
     } catch (error) {
       console.error('ERR_FETCH_HISTORICAL_BLOCKSIZES', error)
     } finally {
       this.fetchingHistoricalBlocksData = false
     }
+  }
+
+  // Only the days with no stored row are fetched, so a few days lost to
+  // upstream errors cost a few calls on the next run rather than a re-fetch
+  // of the whole history. A day that stays unfetched (or a throttled run cut
+  // short) is simply picked up again on the next cycle.
+  _missingTimestamps (timestamps, rows) {
+    const stored = new Set(rows.map((row) => row?.ts))
+    return timestamps.filter((ts) => !stored.has(ts))
   }
 
   async saveHistoricalPrices () {
@@ -345,12 +355,9 @@ class WrkMempoolRack extends TetherWrkBase {
         })
       } catch (_) {}
 
-      if (pricesResponse.length < timestamps.length - 1) {
-        for (const ts of timestamps) {
-          await this._fetchAndSaveHistoricalPrice(ts)
-        }
-      } else {
-        await this._fetchAndSaveHistoricalPrice(getUTCMidnightToday())
+      for (const ts of this._missingTimestamps(timestamps, pricesResponse)) {
+        if (this._isApiThrottled()) break
+        await this._fetchAndSaveHistoricalPrice(ts)
       }
     } catch (error) {
       console.error('ERR_FETCH_HISTORICAL_PRICES', error)
@@ -414,32 +421,62 @@ class WrkMempoolRack extends TetherWrkBase {
     }
   }
 
+  // The gap before the next upstream call: the regular spacing, stretched to
+  // the end of any 429 backoff still in force.
   async _rateLimitDelay () {
-    await sleep(1000)
+    const pausedFor = (this._apiPausedUntil || 0) - Date.now()
+    await sleep(Math.max(API_CALL_GAP_MS, pausedFor))
   }
 
-  async _fetchWithDelay (fn, obj, args) {
-    // fetch api data with delay due to api rate limits.
-    // Chained so the delay is a real gap between upstream calls rather than a
-    // per-caller sleep: the price sampler runs on its own interval and would
-    // otherwise fire alongside the polling cycles, both waking after the same
-    // 5s and hitting the API together.
+  _isApiThrottled () {
+    return (this._apiPausedUntil || 0) > Date.now()
+  }
+
+  // A 429 pauses the whole chain: for Retry-After when upstream sends one,
+  // otherwise for a doubling backoff that a successful call resets.
+  _onApiRateLimited (err) {
+    const retryAfterSec = Number(err?.headers?.['retry-after'])
+    const backoffMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+      ? retryAfterSec * 1000
+      : Math.min(Math.max((this._apiBackoffMs || 0) * 2, API_BACKOFF_MIN_MS), API_BACKOFF_MAX_MS)
+    this._apiBackoffMs = backoffMs
+    this._apiPausedUntil = Date.now() + backoffMs
+    console.error(new Date().toISOString(), `ERR_API_RATE_LIMITED, pausing upstream calls for ${backoffMs}ms`)
+  }
+
+  // Every upstream call goes through this one chain, so the gap is a real gap
+  // between calls across the whole worker rather than a per-caller sleep: the
+  // price sampler, the polling cycles and the rebates sync would otherwise
+  // wake together and hit the API at once. Errors propagate.
+  async _apiCall (fn, obj, args) {
     const previous = this._apiChain || Promise.resolve()
     let release
     this._apiChain = new Promise((resolve) => { release = resolve })
 
     try {
       await previous
-      await sleep(5000)
+      await this._rateLimitDelay()
       try {
-        return await fn.call(obj, args)
+        const res = await fn.call(obj, args)
+        this._apiBackoffMs = 0
+        return res
       } catch (e) {
-        console.error(new Date().toISOString(), e)
+        if (e?.status === HTTP_STATUS_TOO_MANY_REQUESTS) this._onApiRateLimited(e)
+        throw e
       }
-
-      return null
     } finally {
       release()
+    }
+  }
+
+  // For the polled datasets, where a missed call is simply retried on the
+  // next cycle: errors are logged and come back as null.
+  async _fetchWithDelay (fn, obj, args) {
+    try {
+      return await this._apiCall(fn, obj, args)
+    } catch (e) {
+      console.error(new Date().toISOString(), e)
+      return null
     }
   }
 
@@ -563,8 +600,8 @@ class WrkMempoolRack extends TetherWrkBase {
     // end the walk - never a short page or a page count, which would drop the
     // older part of a busy window for good once the cursor moves past it.
     for (;;) {
-      await this._rateLimitDelay()
-      const batch = await this.mempoolApi.getAddressTxs({ address, afterTxid: lastSeenTxid })
+      const api = this.mempoolApi
+      const batch = await this._apiCall(api.getAddressTxs, api, { address, afterTxid: lastSeenTxid })
       if (!Array.isArray(batch) || !batch.length) break
 
       for (const tx of batch) {
@@ -749,8 +786,8 @@ class WrkMempoolRack extends TetherWrkBase {
     if (bucket?.priceUSD) return bucket.priceUSD
 
     try {
-      await this._rateLimitDelay()
-      const res = await this.mempoolApi.getHistoricalPrices({ currency: 'USD', timestamp: Math.floor(ts / 1000) })
+      const api = this.mempoolApi
+      const res = await this._apiCall(api.getHistoricalPrices, api, { currency: 'USD', timestamp: Math.floor(ts / 1000) })
       const priceUSD = res?.prices?.[0]?.USD
       if (!priceUSD) return undefined
 
